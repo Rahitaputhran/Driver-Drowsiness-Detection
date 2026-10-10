@@ -1,133 +1,172 @@
 import cv2
 import time
-import pygame
-import pickle
-import numpy as np
 import mediapipe as mp
 from math import hypot, degrees, atan2
-from xgboost import XGBClassifier
 
-# === Load Trained Model and Scaler ===
-with open("best_drowsiness_model.pkl", "rb") as f:
-    model = pickle.load(f)
+# ---------------- Configuration ----------------
+CAMERA_INDEX = 0
+EAR_THRESHOLD = 0.28
+MAR_THRESHOLD = 0.75
+TILT_THRESHOLD = 25.0
+EYE_CLOSED_DURATION = 2.0
 
-with open("standard_scaler.pkl", "rb") as f:
-    scaler = pickle.load(f)
+LEFT_EYE = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
-# === Initialize MediaPipe FaceMesh ===
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
 
-# === Pygame alert setup ===
-pygame.mixer.init()
-pygame.mixer.music.load("alert.wav")
-
-# === Feature Calculation Functions ===
+# ---------------- Feature calculations ----------------
 def euclidean(p1, p2):
     return hypot(p2[0] - p1[0], p2[1] - p1[1])
 
-def get_EAR(landmarks, eye_indices):
-    A = euclidean(landmarks[eye_indices[1]], landmarks[eye_indices[5]])
-    B = euclidean(landmarks[eye_indices[2]], landmarks[eye_indices[4]])
-    C = euclidean(landmarks[eye_indices[0]], landmarks[eye_indices[3]])
-    return (A + B) / (2.0 * C)
 
-def get_MAR(landmarks):
-    top = landmarks[13]
-    bottom = landmarks[14]
-    left = landmarks[78]
-    right = landmarks[308]
-    return euclidean(top, bottom) / euclidean(left, right)
+def get_ear(landmarks, eye_indices):
+    vertical_1 = euclidean(
+        landmarks[eye_indices[1]], landmarks[eye_indices[5]]
+    )
+    vertical_2 = euclidean(
+        landmarks[eye_indices[2]], landmarks[eye_indices[4]]
+    )
+    horizontal = euclidean(
+        landmarks[eye_indices[0]], landmarks[eye_indices[3]]
+    )
+
+    if horizontal == 0:
+        return 0.0
+
+    return (vertical_1 + vertical_2) / (2.0 * horizontal)
+
+
+def get_mar(landmarks):
+    mouth_height = euclidean(landmarks[13], landmarks[14])
+    mouth_width = euclidean(landmarks[78], landmarks[308])
+
+    if mouth_width == 0:
+        return 0.0
+
+    return mouth_height / mouth_width
+
 
 def get_head_tilt(landmarks):
-    nose = landmarks[1]
-    chin = landmarks[152]
-    dx = chin[0] - nose[0]
-    dy = chin[1] - nose[1]
-    angle = abs(degrees(atan2(dy, dx)) - 90)
-    return angle
+    # Approximate roll angle using the line between the eye corners.
+    left_eye = landmarks[33]
+    right_eye = landmarks[263]
+    dx = right_eye[0] - left_eye[0]
+    dy = right_eye[1] - left_eye[1]
 
-# === Constants and Thresholds ===
-LEFT_EYE = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-MAR_THRESHOLD = 0.75
-EAR_THRESHOLD = 0.28
-TILT_THRESHOLD = 25
-EYE_CLOSED_DURATION = 2  # seconds
+    if dx == 0 and dy == 0:
+        return 0.0
 
-# === Start Webcam ===
-cap = cv2.VideoCapture(0)
-eye_closed_start = None
-status = "Alert"
+    return abs(degrees(atan2(dy, dx)))
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
 
-    h, w = frame.shape[:2]
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb)
+# ---------------- Main application ----------------
+def main():
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
 
-    if results.multi_face_landmarks:
-        landmarks = [(int(p.x * w), int(p.y * h)) for p in results.multi_face_landmarks[0].landmark]
+    cap = cv2.VideoCapture(CAMERA_INDEX)
 
-        left_ear = get_EAR(landmarks, LEFT_EYE)
-        right_ear = get_EAR(landmarks, RIGHT_EYE)
-        ear = (left_ear + right_ear) / 2.0
-        mar = get_MAR(landmarks)
-        tilt = get_head_tilt(landmarks)
+    if not cap.isOpened():
+        print(
+            "Error: Could not open webcam. Check camera permissions "
+            "or change CAMERA_INDEX to 1."
+        )
+        face_mesh.close()
+        return
 
-        is_eye_closed = ear < EAR_THRESHOLD
-        is_mouth_open = mar > MAR_THRESHOLD
-        is_head_tilted = tilt > TILT_THRESHOLD
+    eye_closed_start = None
+    print("Drowsiness demo running. Press Q in the video window to quit.")
+    print("Note: This is a threshold-based demo, not the repository's ML model.")
 
-        # === Eye Closure Timer Logic ===
-        if is_eye_closed:
-            if eye_closed_start is None:
-                eye_closed_start = time.time()
-            eye_closed_duration = time.time() - eye_closed_start
-        else:
-            eye_closed_duration = 0
-            eye_closed_start = None
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Error: Could not read a frame from the webcam.")
+                break
 
-        # === Feature Vector (for ML Model) ===
-        features = np.array([[left_ear, right_ear, ear, mar, tilt, int(is_eye_closed)]])
-        features_scaled = scaler.transform(features)
-        prediction = model.predict(features_scaled)[0]
+            # Mirror the camera image for a more natural preview.
+            frame = cv2.flip(frame, 1)
+            height, width = frame.shape[:2]
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(rgb_frame)
 
-        # === Drowsiness Classification Logic ===
-        if eye_closed_duration >= EYE_CLOSED_DURATION:
-            status = "Drowsy (Eyes Closed)"
-        elif is_mouth_open:
-            status = "Drowsy (Yawning)"
-        elif is_eye_closed and is_head_tilted:
-            status = "Drowsy (Head Tilt)"
-        else:
-            status = "Alert"
+            status = "No face detected"
+            color = (0, 0, 255)
 
-        # === Sound Alert ===
-        if "Drowsy" in status:
-            if not pygame.mixer.music.get_busy():
-                pygame.mixer.music.play(-1)
-        else:
-            pygame.mixer.music.stop()
+            if results.multi_face_landmarks:
+                face_landmarks = results.multi_face_landmarks[0]
+                landmarks = [
+                    (int(point.x * width), int(point.y * height))
+                    for point in face_landmarks.landmark
+                ]
 
-        # === Display Status ===
-        color = (0, 0, 255) if "Drowsy" in status else (0, 255, 0)
-        cv2.putText(frame, f"EAR: {ear:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        cv2.putText(frame, f"MAR: {mar:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        cv2.putText(frame, f"Tilt: {tilt:.1f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        cv2.putText(frame, status, (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
-    else:
-        pygame.mixer.music.stop()
-        cv2.putText(frame, "No face detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                left_ear = get_ear(landmarks, LEFT_EYE)
+                right_ear = get_ear(landmarks, RIGHT_EYE)
+                ear = (left_ear + right_ear) / 2.0
+                mar = get_mar(landmarks)
+                tilt = get_head_tilt(landmarks)
 
-    cv2.imshow("Drowsiness Detection (Model-Based)", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+                eyes_closed = ear < EAR_THRESHOLD
+                mouth_open = mar > MAR_THRESHOLD
+                head_tilted = tilt > TILT_THRESHOLD
 
-# === Cleanup ===
-cap.release()
-cv2.destroyAllWindows()
-pygame.mixer.quit()
+                if eyes_closed:
+                    if eye_closed_start is None:
+                        eye_closed_start = time.time()
+                    closed_duration = time.time() - eye_closed_start
+                else:
+                    eye_closed_start = None
+                    closed_duration = 0.0
+
+                if closed_duration >= EYE_CLOSED_DURATION:
+                    status = "Drowsy: eyes closed"
+                elif mouth_open:
+                    status = "Possible yawn"
+                elif eyes_closed and head_tilted:
+                    status = "Possible drowsiness: head tilt"
+                else:
+                    status = "Alert"
+
+                color = (0, 0, 255) if "Drowsy" in status or "Possible" in status else (0, 200, 0)
+
+                cv2.putText(
+                    frame, f"EAR: {ear:.3f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2
+                )
+                cv2.putText(
+                    frame, f"MAR: {mar:.3f}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2
+                )
+                cv2.putText(
+                    frame, f"Head roll: {tilt:.1f}", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2
+                )
+
+            else:
+                # Require a fresh continuous closure period after face loss.
+                eye_closed_start = None
+
+            cv2.putText(
+                frame, status, (10, 130),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2
+            )
+            cv2.imshow("Driver Drowsiness Detection", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        face_mesh.close()
+
+
+if __name__ == "__main__":
+    main()
