@@ -1,6 +1,7 @@
-.venv/
+﻿.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.env
 .ipynb_checkpoints/
 models/*.joblib
 models/*.keras
