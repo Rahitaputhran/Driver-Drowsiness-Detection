@@ -1,6 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -12,6 +13,7 @@ from src.config import (
     FRAME_HEIGHT,
     FRAME_WIDTH,
     FACE_MODEL_PATH,
+    XGB_MODEL_PATH,
     EAR_CLOSED_THRESHOLD,
     MAR_YAWN_THRESHOLD,
     WARNING_SCORE,
@@ -19,662 +21,248 @@ from src.config import (
 )
 from src.face_landmarks import FaceLandmarker
 from src.features import eye_aspect_ratio, mouth_aspect_ratio
-from src.temporal import TemporalFeatures
 from src.head_pose import estimate_head_pose
 from src.decision import HysteresisDecision
 from src.alarm import beep
-
-
-# =========================================================
-# MediaPipe landmark indices
-# These MUST match training/collect_features.py
-# =========================================================
+from training.collect_features import (
+    SAMPLE_INTERVAL,
+    WINDOW_SECONDS,
+    MIN_SAMPLES_FOR_FEATURES,
+    YAWN_MIN_DURATION,
+)
 
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE = [33, 160, 158, 133, 153, 144]
-
 MOUTH = [61, 291, 0, 17, 269, 405]
-
-# Required order for estimate_head_pose():
-# nose, chin, left eye outer, right eye outer,
-# left mouth corner, right mouth corner
 POSE_POINTS = [1, 152, 263, 33, 61, 291]
+FEATURES = [
+    "ear", "mar", "perclos", "eye_closed_ratio", "max_eye_closure_s",
+    "blink_rate", "yawn_rate", "head_pitch", "head_yaw", "head_roll",
+    "head_motion",
+]
 
-
-# =========================================================
-# Paths
-# =========================================================
-
-MODEL_PATH = Path("models/drowsiness_xgb.joblib")
-
-
-# =========================================================
-# Helper
-# =========================================================
 
 def lm_xy(landmarks, indices, w, h):
-    """Convert MediaPipe normalized landmarks to pixel coordinates."""
-
     return np.array(
-        [
-            [landmarks[i].x * w, landmarks[i].y * h]
-            for i in indices
-        ],
+        [[landmarks[i].x * w, landmarks[i].y * h] for i in indices],
         dtype=np.float64,
     )
 
 
-# =========================================================
-# Main
-# =========================================================
-
 def main():
+    face_path = Path(FACE_MODEL_PATH)
+    model_path = Path(XGB_MODEL_PATH)
 
-    # -----------------------------------------------------
-    # Check MediaPipe model
-    # -----------------------------------------------------
-
-    if not Path(FACE_MODEL_PATH).exists():
+    if not face_path.exists():
         raise SystemExit(
-            f"Missing {FACE_MODEL_PATH}.\n"
-            "Place the MediaPipe Face Landmarker model there."
+            f"Missing MediaPipe model: {face_path}\n"
+            "Place face_landmarker.task in the models folder."
+        )
+    if not model_path.exists():
+        raise SystemExit(f"Missing trained XGBoost model: {model_path}")
+
+    print(f"Loading XGBoost model: {model_path}")
+    bundle = joblib.load(model_path)
+    if not isinstance(bundle, dict) or "model" not in bundle:
+        raise SystemExit(
+            "Unexpected model format. Expected a bundle with 'model' and 'features'."
         )
 
-    # -----------------------------------------------------
-    # Check XGBoost model
-    # -----------------------------------------------------
-
-    if not MODEL_PATH.exists():
+    model = bundle["model"]
+    feature_names = bundle.get("features", FEATURES)
+    if feature_names != FEATURES:
         raise SystemExit(
-            f"Missing trained model: {MODEL_PATH}\n"
-            "Train the model first."
+            "Model feature order does not match the live pipeline.\n"
+            f"Expected: {FEATURES}\nFound: {feature_names}\n"
+            "Retrain with training.train_xgboost before running the app."
+        )
+    if getattr(model, "n_features_in_", None) != len(FEATURES):
+        raise SystemExit(
+            f"Model expects {getattr(model, 'n_features_in_', 'unknown')} features; "
+            f"this app supplies {len(FEATURES)}. Retrain the model first."
         )
 
-    # -----------------------------------------------------
-    # Load trained XGBoost model
-    # -----------------------------------------------------
-
-    print("Loading trained XGBoost model...")
-
-    model_bundle = joblib.load(MODEL_PATH)
-
-    # Your .joblib contains:
-    # {
-    #     "model": trained XGBoost model,
-    #     "features": feature names
-    # }
-
-    if not isinstance(model_bundle, dict):
-        raise SystemExit(
-            "Unexpected model file format."
-        )
-
-    if "model" not in model_bundle:
-        raise SystemExit(
-            "Model bundle does not contain 'model'."
-        )
-
-    model = model_bundle["model"]
-
-    feature_names = model_bundle.get(
-        "features",
-        [],
-    )
-
-    print("Model loaded successfully.")
-    print("Features:", feature_names)
-
-    # -----------------------------------------------------
-    # Webcam
-    # -----------------------------------------------------
+    print("Model loaded. Features:", ", ".join(feature_names))
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
-
-    cap.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        FRAME_WIDTH,
-    )
-
-    cap.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        FRAME_HEIGHT,
-    )
-
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     if not cap.isOpened():
-        raise SystemExit(
-            "Could not open webcam."
-        )
+        raise SystemExit("Could not open webcam. Check CAMERA_INDEX and camera permissions.")
 
-    # -----------------------------------------------------
-    # MediaPipe Face Landmarker
-    # -----------------------------------------------------
-
-    detector = FaceLandmarker(
-        FACE_MODEL_PATH
-    )
-
-    # -----------------------------------------------------
-    # Temporal feature tracker
-    # -----------------------------------------------------
-
-    temporal = TemporalFeatures(
-        window_seconds=30.0
-    )
-
-    # -----------------------------------------------------
-    # Decision layer
-    # -----------------------------------------------------
-
-    decision = HysteresisDecision(
-        WARNING_SCORE,
-        DROWSY_SCORE,
-    )
-
-    # -----------------------------------------------------
-    # Timing
-    # -----------------------------------------------------
-
-    start = time.monotonic()
-
-    last_alarm = -999.0
-
-    # -----------------------------------------------------
-    # Head pose history
-    # -----------------------------------------------------
-
+    detector = FaceLandmarker(str(face_path))
+    decision = HysteresisDecision(WARNING_SCORE, DROWSY_SCORE)
+    history = deque()
     pose_history = []
 
-    # =====================================================
-    # Main webcam loop
-    # =====================================================
+    start_time = time.monotonic()
+    last_prediction_time = 0.0
+    last_alarm = -999.0
+    previous_eye_closed = False
+    eye_closure_start = None
+    blink_count = 0
+    previous_yawn = False
+    yawn_start = None
+    yawn_count = 0
+    max_eye_closure = 0.0
+    last_label = "WARMING UP"
+    last_score = 0.0
+    latest_features = None
+
+    print("ML-based drowsiness detection running. Press Q to quit.")
+    print("Predictions are experimental; do not use this demo as a driving-safety device.")
 
     try:
-
         while True:
-
             ok, frame = cap.read()
-
             if not ok:
-                print("Could not read frame.")
+                print("Could not read frame from webcam.")
                 break
 
             h, w = frame.shape[:2]
-
-            timestamp = (
-                time.monotonic() - start
-            )
-
-            # -------------------------------------------------
-            # MediaPipe face detection / landmarks
-            # -------------------------------------------------
-
-            result = detector.detect(
-                frame,
-                int(timestamp * 1000),
-            )
-
-            # -------------------------------------------------
-            # Default values
-            # -------------------------------------------------
-
-            label = "NO FACE"
-
-            score = 0.0
-
-            ear = 0.0
-            mar = 0.0
-
-            perclos = 0.0
-
-            eye_closed_ratio = 0.0
-            max_eye_closure_s = 0.0
-
-            blink_rate = 0.0
-            yawn_rate = 0.0
-
-            head_pitch = 0.0
-            head_yaw = 0.0
-            head_roll = 0.0
-            head_motion = 0.0
-
-            # =================================================
-            # Face available
-            # =================================================
+            timestamp = time.monotonic() - start_time
+            result = detector.detect(frame, int(timestamp * 1000))
+            status_color = (0, 0, 255)
+            ear = mar = 0.0
 
             if result.face_landmarks:
-
                 landmarks = result.face_landmarks[0]
-
-                # -------------------------------------------------
-                # 1. Extract eyes and mouth
-                # -------------------------------------------------
-
-                left = lm_xy(
-                    landmarks,
-                    LEFT_EYE,
-                    w,
-                    h,
-                )
-
-                right = lm_xy(
-                    landmarks,
-                    RIGHT_EYE,
-                    w,
-                    h,
-                )
-
-                mouth = lm_xy(
-                    landmarks,
-                    MOUTH,
-                    w,
-                    h,
-                )
-
-                # -------------------------------------------------
-                # 2. EAR
-                # -------------------------------------------------
-
-                left_ear = eye_aspect_ratio(
-                    left
-                )
-
-                right_ear = eye_aspect_ratio(
-                    right
-                )
-
+                left = lm_xy(landmarks, LEFT_EYE, w, h)
+                right = lm_xy(landmarks, RIGHT_EYE, w, h)
+                mouth = lm_xy(landmarks, MOUTH, w, h)
                 ear = (
-                    left_ear + right_ear
+                    eye_aspect_ratio(left) + eye_aspect_ratio(right)
                 ) / 2.0
+                mar = mouth_aspect_ratio(mouth)
 
-                # -------------------------------------------------
-                # 3. MAR
-                # -------------------------------------------------
+                # Match the collection script's blink counting rules.
+                eye_closed = ear < EAR_CLOSED_THRESHOLD
+                if eye_closed and not previous_eye_closed:
+                    eye_closure_start = timestamp
+                if not eye_closed and previous_eye_closed and eye_closure_start is not None:
+                    closure_duration = timestamp - eye_closure_start
+                    max_eye_closure = max(max_eye_closure, closure_duration)
+                    if 0.05 <= closure_duration <= 0.8:
+                        blink_count += 1
+                    eye_closure_start = None
+                previous_eye_closed = eye_closed
+                if eye_closed and eye_closure_start is not None:
+                    max_eye_closure = max(
+                        max_eye_closure, timestamp - eye_closure_start
+                    )
 
-                mar = mouth_aspect_ratio(
-                    mouth
-                )
+                # Match the collection script's sustained-yawn counting rules.
+                yawning = mar > MAR_YAWN_THRESHOLD
+                if yawning and not previous_yawn:
+                    yawn_start = timestamp
+                if not yawning and previous_yawn and yawn_start is not None:
+                    if timestamp - yawn_start >= YAWN_MIN_DURATION:
+                        yawn_count += 1
+                    yawn_start = None
+                previous_yawn = yawning
 
-                # -------------------------------------------------
-                # 4. Temporal features
-                # -------------------------------------------------
+                pose_points = lm_xy(landmarks, POSE_POINTS, w, h)
+                pose = estimate_head_pose(pose_points, w, h)
+                if pose is None:
+                    pitch = yaw = roll = 0.0
+                else:
+                    pitch = pose["pitch"]
+                    yaw = pose["yaw"]
+                    roll = pose["roll"]
 
-                tf = temporal.update(
-                    timestamp,
-                    ear,
-                    mar,
-                    EAR_CLOSED_THRESHOLD,
-                    MAR_YAWN_THRESHOLD,
-                )
-
-                perclos = tf["perclos"]
-
-                closed_duration = tf[
-                    "eye_closed_duration"
-                ]
-
-                # Same feature representation used
-                # during training.
-                eye_closed_ratio = perclos
-
-                # Current continuous eye-closure duration.
-                max_eye_closure_s = closed_duration
-
-                # -------------------------------------------------
-                # 5. Blink rate
-                # -------------------------------------------------
-
-                elapsed_minutes = max(
-                    timestamp / 60.0,
-                    1.0 / 60.0,
-                )
-
-                blink_rate = (
-                    tf["blink_count"]
-                    / elapsed_minutes
-                )
-
-                # -------------------------------------------------
-                # 6. Yawn rate
-                # -------------------------------------------------
-
-                yawn_rate = (
-                    tf["yawn_count"]
-                    / elapsed_minutes
-                )
-
-                # -------------------------------------------------
-                # 7. Head pose
-                # -------------------------------------------------
-
-                pose_points = lm_xy(
-                    landmarks,
-                    POSE_POINTS,
-                    w,
-                    h,
-                )
-
-                pose = estimate_head_pose(
-                    pose_points,
-                    w,
-                    h,
-                )
-
-                if pose is not None:
-
-                    head_pitch = pose[
-                        "pitch"
-                    ]
-
-                    head_yaw = pose[
-                        "yaw"
-                    ]
-
-                    head_roll = pose[
-                        "roll"
-                    ]
-
-                # -------------------------------------------------
-                # 8. Head motion
-                # -------------------------------------------------
-
-                pose_history.append(
-                    [
-                        head_pitch,
-                        head_yaw,
-                        head_roll,
-                    ]
-                )
-
-                # Keep recent history bounded.
-                if len(pose_history) > 300:
+                pose_history.append((pitch, yaw, roll))
+                if len(pose_history) > 3000:
                     pose_history.pop(0)
 
-                pose_array = np.asarray(
-                    pose_history,
-                    dtype=np.float64,
-                )
+                # Store per-frame observations, then aggregate over the same
+                # rolling window used by the collector.
+                history.append((timestamp, ear, mar, eye_closed, pitch, yaw, roll))
+                while history and timestamp - history[0][0] > WINDOW_SECONDS:
+                    history.popleft()
 
-                if len(pose_array) > 1:
+                if timestamp - last_prediction_time >= SAMPLE_INTERVAL and len(history) >= MIN_SAMPLES_FOR_FEATURES:
+                    arr = np.asarray([item[1:] for item in history], dtype=np.float64)
+                    ears = arr[:, 0]
+                    mars = arr[:, 1]
+                    closed = arr[:, 2].astype(bool)
+                    pitches = arr[:, 3]
+                    yaws = arr[:, 4]
+                    rolls = arr[:, 5]
 
-                    head_motion = float(
-                        np.std(
-                            pose_array[:, 0]
-                        )
-                        + np.std(
-                            pose_array[:, 1]
-                        )
-                        + np.std(
-                            pose_array[:, 2]
-                        )
-                    )
-
-                # =================================================
-                # 9. Create EXACT 11 model features
-                # =================================================
-
-                feature_values = [
-                    ear,
-                    mar,
-                    perclos,
-                    eye_closed_ratio,
-                    max_eye_closure_s,
-                    blink_rate,
-                    yawn_rate,
-                    head_pitch,
-                    head_yaw,
-                    head_roll,
-                    head_motion,
-                ]
-
-                # -------------------------------------------------
-                # Use saved feature order if available
-                # -------------------------------------------------
-
-                if feature_names:
+                    elapsed_minutes = max(timestamp / 60.0, 1.0 / 60.0)
+                    perclos = float(np.mean(closed))
+                    eye_closed_ratio = perclos
+                    blink_rate = blink_count / elapsed_minutes
+                    yawn_rate = yawn_count / elapsed_minutes
+                    head_motion = float(np.std(pitches) + np.std(yaws) + np.std(rolls))
 
                     feature_map = {
-                        "ear": ear,
-                        "mar": mar,
+                        "ear": float(np.mean(ears)),
+                        "mar": float(np.mean(mars)),
                         "perclos": perclos,
                         "eye_closed_ratio": eye_closed_ratio,
-                        "max_eye_closure_s": max_eye_closure_s,
-                        "blink_rate": blink_rate,
-                        "yawn_rate": yawn_rate,
-                        "head_pitch": head_pitch,
-                        "head_yaw": head_yaw,
-                        "head_roll": head_roll,
+                        "max_eye_closure_s": float(max_eye_closure),
+                        "blink_rate": float(blink_rate),
+                        "yawn_rate": float(yawn_rate),
+                        "head_pitch": float(np.mean(pitches)),
+                        "head_yaw": float(np.mean(yaws)),
+                        "head_roll": float(np.mean(rolls)),
                         "head_motion": head_motion,
                     }
-
-                    feature_values = [
-                        feature_map[name]
-                        for name in feature_names
-                    ]
-
-                features = np.array(
-                    [feature_values],
-                    dtype=np.float32,
-                )
-
-                # =================================================
-                # 10. XGBoost prediction
-                # =================================================
-
-                probability = (
-                    model.predict_proba(
-                        features
-                    )[0, 1]
-                )
-
-                score = float(
-                    probability
-                )
-
-                # =================================================
-                # 11. Decision layer
-                # =================================================
-
-                d = decision.update(
-                    score
-                )
-
-                label = d.label
-
-                # =================================================
-                # 12. Alarm
-                # =================================================
-
-                if label == "DROWSY":
-
-                    if (
-                        timestamp - last_alarm
-                        > 2.0
-                    ):
-
-                        beep()
-
-                        last_alarm = (
-                            timestamp
-                        )
-
-                # =================================================
-                # Draw landmarks
-                # =================================================
-
-                for point in np.vstack(
-                    [
-                        left,
-                        right,
-                        mouth,
-                    ]
-                ).astype(int):
-
-                    cv2.circle(
-                        frame,
-                        tuple(point),
-                        2,
-                        (0, 255, 0),
-                        -1,
+                    x = np.asarray([[feature_map[name] for name in feature_names]], dtype=np.float32)
+                    probability = float(model.predict_proba(x)[0, 1])
+                    # Require supporting eye-closure evidence before
+                    # allowing the ML score to trigger a warning.
+                    sustained_closure = (
+                        eye_closed
+                        and eye_closure_start is not None
+                        and timestamp - eye_closure_start >= 1.5
                     )
+                    eye_evidence = perclos >= 0.15 or sustained_closure
+                    gated_probability = probability if eye_evidence else 0.0
+                    result_decision = decision.update(gated_probability)
+                    last_label = result_decision.label
+                    last_score = probability
+                    latest_features = feature_map
+                    last_prediction_time = timestamp
 
-            # =====================================================
-            # Display information
-            # =====================================================
+                    if last_label == "DROWSY" and timestamp - last_alarm > 2.0:
+                        beep()
+                        last_alarm = timestamp
 
-            cv2.rectangle(
-                frame,
-                (10, 10),
-                (500, 305),
-                (20, 20, 20),
-                -1,
-            )
+                for point in np.vstack([left, right, mouth]).astype(int):
+                    cv2.circle(frame, tuple(point), 2, (0, 255, 0), -1)
 
-            cv2.putText(
-                frame,
-                f"STATUS: {label}",
-                (25, 42),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (255, 255, 255),
-                2,
-            )
+                status_color = (0, 0, 255) if last_label in ("WARNING", "DROWSY") else (0, 200, 0)
+                display_label = last_label
+            else:
+                # Do not fabricate a prediction when no face is detected.
+                display_label = "NO FACE"
+                previous_eye_closed = False
+                eye_closure_start = None
+                previous_yawn = False
+                yawn_start = None
 
-            cv2.putText(
-                frame,
-                f"EAR: {ear:.3f}",
-                (25, 72),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (255, 255, 255),
-                1,
-            )
+            cv2.rectangle(frame, (10, 10), (520, 220), (20, 20, 20), -1)
+            cv2.putText(frame, f"STATUS: {display_label}", (25, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.85, status_color, 2)
+            cv2.putText(frame, f"ML drowsiness score: {last_score:.1%}", (25, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
+            cv2.putText(frame, f"Live EAR: {ear:.3f}   MAR: {mar:.3f}", (25, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 1)
+            if latest_features:
+                cv2.putText(frame, f"PERCLOS: {latest_features['perclos']:.1%}", (25, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 1)
+                cv2.putText(frame, f"Eye closure max: {latest_features['max_eye_closure_s']:.2f}s", (25, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+            else:
+                cv2.putText(frame, "Collecting temporal features...", (25, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 1)
+            cv2.putText(frame, "Press Q to quit", (25, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 200, 200), 1)
+            cv2.imshow("Driver Drowsiness Detection - XGBoost", frame)
 
-            cv2.putText(
-                frame,
-                f"MAR: {mar:.3f}",
-                (25, 97),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (255, 255, 255),
-                1,
-            )
-
-            cv2.putText(
-                frame,
-                f"PERCLOS: {perclos:.1%}",
-                (25, 122),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (255, 255, 255),
-                1,
-            )
-
-            cv2.putText(
-                frame,
-                f"Drowsiness: {score:.1%}",
-                (25, 147),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (255, 255, 255),
-                1,
-            )
-
-            cv2.putText(
-                frame,
-                f"Eye closure: {max_eye_closure_s:.2f}s",
-                (25, 172),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                1,
-            )
-
-            cv2.putText(
-                frame,
-                f"Blink rate: {blink_rate:.1f}/min",
-                (25, 197),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                1,
-            )
-
-            cv2.putText(
-                frame,
-                f"Yawn rate: {yawn_rate:.1f}/min",
-                (25, 222),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                1,
-            )
-
-            cv2.putText(
-                frame,
-                (
-                    f"Head: "
-                    f"P{head_pitch:.1f} "
-                    f"Y{head_yaw:.1f} "
-                    f"R{head_roll:.1f}"
-                ),
-                (25, 247),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.50,
-                (255, 255, 255),
-                1,
-            )
-
-            cv2.putText(
-                frame,
-                f"Head motion: {head_motion:.2f}",
-                (25, 272),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.50,
-                (255, 255, 255),
-                1,
-            )
-
-            cv2.putText(
-                frame,
-                "Press Q to quit",
-                (25, 297),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (200, 200, 200),
-                1,
-            )
-
-            # -----------------------------------------------------
-            # Show webcam
-            # -----------------------------------------------------
-
-            cv2.imshow(
-                "Driver Drowsiness Detection",
-                frame,
-            )
-
-            # -----------------------------------------------------
-            # Quit
-            # -----------------------------------------------------
-
-            if (
-                cv2.waitKey(1) & 0xFF
-                == ord("q")
-            ):
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-
     finally:
-
         detector.close()
-
         cap.release()
-
         cv2.destroyAllWindows()
 
 
-# =========================================================
-# Entry point
-# =========================================================
-
 if __name__ == "__main__":
     main()
+
